@@ -500,12 +500,35 @@ async fn handle_request(
     // Metadata requests skip the curation check_download (which only runs for
     // tarballs), so we must protect the proxy path separately. This runs after
     // cache lookup so locally-published packages are still served from cache.
-    if let Some(response) = crate::curation::check_namespace_isolation(
+    //
+    // A guarded name we do not hold answers **404, not 403**. The guarantee this
+    // filter owes is that a guarded name is never satisfied from upstream, and 404
+    // keeps it whole - the proxy fetch below is skipped either way, which is the
+    // entire protection. What 403 adds on top is an announcement that the name is
+    // filtered, and that announcement is not free:
+    //
+    //   - It makes a guarded package unpublishable. Publishing tools read the
+    //     packument first to decide whether a version is already up, and a careful
+    //     one refuses to guess on any status but 200 or 404 - guessing there is how
+    //     a release silently re-publishes or silently skips. So the *first* publish
+    //     of every guarded name deadlocks, which is precisely the set of names an
+    //     operator listed because they own them and intend to publish them. The only
+    //     escape is to remove the entry, publish, and put it back - and that window
+    //     is when the upstream package gets proxied and cached locally, permanently
+    //     defeating the filter for that name.
+    //   - It leaks. 403 tells an unauthenticated caller that this name is one the
+    //     operator considers theirs. 404 tells them nothing they did not already know.
+    //
+    // The metrics still record the refusal inside `check_namespace_isolation`; only
+    // the status the client sees changes.
+    if crate::curation::check_namespace_isolation(
         &state.curation().curation_engine,
         crate::curation::RegistryType::Npm,
         &package_name,
-    ) {
-        return response;
+    )
+    .is_some()
+    {
+        return StatusCode::NOT_FOUND.into_response();
     }
 
     // --- Proxy fetch path ---

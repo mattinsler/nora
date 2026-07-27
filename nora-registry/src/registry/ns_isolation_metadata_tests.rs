@@ -11,8 +11,10 @@
 //! fixed npm only.
 //!
 //! These tests pin the invariant for EVERY registry:
-//! 1. an internal-namespace package's metadata with no local copy is BLOCKED (403),
-//!    never proxied upstream;
+//! 1. an internal-namespace package's metadata with no local copy is BLOCKED, never
+//!    proxied upstream. **npm answers 404 there, the rest still answer 403** - see
+//!    the npm section below for why the status differs and why the guarantee does
+//!    not;
 //! 2. a locally-published internal package's metadata is still SERVED (200) — the
 //!    guard must come after the local/cache serve, never blocking a local copy;
 //! 3. a non-internal package is NOT blocked (proxies / 404s normally);
@@ -284,6 +286,83 @@ async fn go_internal_stale_cached_served() {
         StatusCode::OK,
         "cached internal go module must be served stale, not re-proxied (Shape B)"
     );
+}
+
+// ── npm: a guarded name we do not hold answers 404, not 403 ──
+//
+// The guarantee is unchanged: it is never satisfied from upstream. Only the status
+// the client sees changes, and it changes because 403 is not free. Publishing tools
+// read the packument first to decide whether a version is already up, and a careful
+// one refuses to guess on any status but 200 or 404. So 403 deadlocks the FIRST
+// publish of every guarded name - exactly the names an operator listed because they
+// own them and intend to publish them. The only escape is to remove the entry,
+// publish, and put it back, and that window is when the upstream package gets
+// proxied and cached locally, permanently defeating the filter for that name.
+//
+// These two tests are a pair, and the pairing is the point. The upstream is a live
+// mock that WOULD serve the package. `BLACKHOLE` cannot tell a guard that held from
+// a proxy that merely failed - both end in 404 - so the leak has to be readable as a
+// 200, which means upstream has to be able to answer.
+
+/// Upstream that answers every request with a packument for version `6.6.6`. Any
+/// test below that sees `6.6.6` in a body has watched the guard leak.
+#[cfg(test)]
+async fn upstream_serving_666() -> wiremock::MockServer {
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            br#"{"name":"internalpkg","dist-tags":{"latest":"6.6.6"},"versions":{"6.6.6":{"name":"internalpkg","version":"6.6.6"}}}"#.to_vec(),
+            "application/json",
+        ))
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+async fn npm_internal_absent_answers_404_and_never_upstream() {
+    let upstream = upstream_serving_666().await;
+    let ctx = create_test_context_with_config(|c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.npm.proxy = Some(upstream.uri());
+    });
+
+    let resp = send(&ctx.app, Method::GET, "/npm/internalpkg", "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a guarded name with no local copy must answer 404, not 403: the 403 only \
+         announces that a filter exists, and that announcement is what makes the \
+         name's first publish impossible"
+    );
+    let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+    assert!(
+        !body.contains("6.6.6"),
+        "guarded name must never be satisfied from upstream, whatever the status"
+    );
+}
+
+#[tokio::test]
+async fn npm_unguarded_absent_still_proxies_the_same_upstream() {
+    let upstream = upstream_serving_666().await;
+    let ctx = create_test_context_with_config(|c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.npm.proxy = Some(upstream.uri());
+    });
+
+    // Same upstream, same request shape, a name the filter does not cover. This is
+    // what makes the 404 above evidence of the guard rather than of a dead proxy.
+    let resp = send(&ctx.app, Method::GET, "/npm/publicpkg", "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "an unguarded name must still proxy - otherwise the guarded 404 proves nothing"
+    );
+    let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+    assert!(body.contains("6.6.6"), "the proxy path must really be serving upstream");
 }
 
 // ── npm: PR #725 residual — TTL-stale refetch must not re-proxy an internal pkg ──

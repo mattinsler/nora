@@ -1322,25 +1322,37 @@ fn split_npm_version_path(path: &str) -> Option<(&str, &str)> {
 ///    npm wants here, byte for byte.
 /// 2. `npm/{pkg}/dist-tags/{selector}` - the mutable pointer key, also written only by
 ///    publish; then (1) for the version it names.
-/// 3. `versions[selector]` inside the packument. Pre-#39 publishes kept their versions
+/// 3. `dist-tags[selector]` inside the packument, again resolved through (1). A publish
+///    that sets no `latest` still gets one: `regenerate_packument` DERIVES it from the
+///    highest version and writes it to the packument only, never to a pointer key. So a
+///    shelf whose releases tag `next` advertises a `latest` that step 2 cannot see.
+/// 4. `versions[selector]` inside the packument. Pre-#39 publishes kept their versions
 ///    embedded in `metadata.json`, and a packument cached from upstream still does, so
 ///    this is the copy we are already serving on the packument path.
 ///
-/// Step 3 is **concrete versions only**. An npm version manifest is immutable, so
-/// whichever local copy we hold is the same document whatever wrote it. A dist-tag is
-/// not - it moves - so resolving one out of a cached upstream packument would answer a
-/// mutable question from a stale copy. Tags resolve only through (2), where a local
-/// publish pointer is the truth; anything else falls through to the guard and the proxy.
+/// Steps 3 and 4 both read the packument, which for a proxied package is UPSTREAM's,
+/// so each is narrowed to what is safe to take from it:
+///
+/// - Step 4 serves concrete versions only. An npm version manifest is immutable, so
+///   whichever local copy we hold is the same document whatever wrote it.
+/// - Step 3 is a tag, which is not immutable - it moves - so it must never be answered
+///   out of a cached upstream packument. The gate is that the version it names has to
+///   have a local `versions/{v}.json` key, and the proxy path never writes one; only
+///   publish does. So a tag resolves exactly when we host the version it points at.
 async fn local_npm_version_document(
     state: &AppState,
     package_name: &str,
     selector: &str,
 ) -> Option<Bytes> {
-    if let Ok(data) = state
-        .storage
-        .get(&format!("npm/{}/versions/{}.json", package_name, selector))
-        .await
-    {
+    let published_version = |version: String| async move {
+        state
+            .storage
+            .get(&format!("npm/{}/versions/{}.json", package_name, version))
+            .await
+            .ok()
+    };
+
+    if let Some(data) = published_version(selector.to_string()).await {
         return Some(data);
     }
 
@@ -1349,12 +1361,11 @@ async fn local_npm_version_document(
         .get(&format!("npm/{}/dist-tags/{}", package_name, selector))
         .await
     {
-        let version = String::from_utf8(pointer.to_vec()).ok()?;
-        return state
-            .storage
-            .get(&format!("npm/{}/versions/{}.json", package_name, version))
-            .await
-            .ok();
+        if let Ok(version) = String::from_utf8(pointer.to_vec()) {
+            if let Some(data) = published_version(version).await {
+                return Some(data);
+            }
+        }
     }
 
     let packument = state
@@ -1363,6 +1374,17 @@ async fn local_npm_version_document(
         .await
         .ok()?;
     let json: serde_json::Value = serde_json::from_slice(&packument).ok()?;
+
+    if let Some(version) = json
+        .get("dist-tags")
+        .and_then(|tags| tags.get(selector))
+        .and_then(|v| v.as_str())
+    {
+        if let Some(data) = published_version(version.to_string()).await {
+            return Some(data);
+        }
+    }
+
     let version_data = json.get("versions")?.get(selector)?;
     serde_json::to_vec(version_data).ok().map(Bytes::from)
 }
@@ -1778,8 +1800,13 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
     use crate::test_helpers::{
-        body_bytes, create_test_context, create_test_context_with_auth, send, send_with_headers,
+        body_bytes, create_test_context, create_test_context_with_auth,
+        create_test_context_with_config, send, send_with_headers,
     };
+
+    /// Connection-refused sentinel: a request that reaches the proxy fails visibly
+    /// rather than quietly succeeding against a real upstream.
+    const BLACKHOLE: &str = "http://127.0.0.1:1";
 
     #[tokio::test]
     async fn test_npm_namespace_scope_enforced() {
@@ -2724,6 +2751,90 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(json["version"], "3.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_npm_version_endpoint_resolves_a_derived_latest_tag() {
+        // A publish that tags only `next` still gets a `latest`: regenerate_packument
+        // derives it from the highest version and writes it to the packument alone,
+        // never to a `dist-tags/latest` key. The endpoint has to see that, or it 404s
+        // a tag the packument it serves is advertising. This is the artemis shelf's
+        // exact shape - its releases tag `next`.
+        let ctx = create_test_context();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz");
+        let payload = serde_json::json!({
+            "name": "derived",
+            "dist-tags": { "next": "0.2.0-next.4" },
+            "versions": { "0.2.0-next.4": { "name": "derived", "version": "0.2.0-next.4", "dist": {} } },
+            "_attachments": { "derived-0.2.0-next.4.tgz": { "data": b64 } }
+        });
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/npm/derived",
+            Body::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // No `dist-tags/latest` key exists...
+        assert!(ctx
+            .state
+            .storage
+            .get("npm/derived/dist-tags/latest")
+            .await
+            .is_err());
+        // ...but the packument advertises one, so the endpoint must honour it.
+        let resp = send(&ctx.app, Method::GET, "/npm/derived", "").await;
+        let packument: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(packument["dist-tags"]["latest"], "0.2.0-next.4");
+
+        let resp = send(&ctx.app, Method::GET, "/npm/derived/latest", "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a derived `latest` the packument advertises must resolve here too"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json["version"], "0.2.0-next.4");
+    }
+
+    #[tokio::test]
+    async fn test_npm_version_endpoint_never_resolves_a_tag_from_a_cached_packument() {
+        // The gate on the step above. A packument cached from UPSTREAM also carries
+        // dist-tags, and a tag moves - answering one from a stale cached copy is a
+        // different bug. The version a tag names must have a local `versions/{v}.json`
+        // key, which only publish writes, so an upstream packument can never satisfy it.
+        let ctx = create_test_context_with_config(|c| {
+            c.npm.proxy = Some(BLACKHOLE.to_string());
+        });
+        // Exactly what the proxy path leaves behind: a packument, no per-version keys.
+        ctx.state
+            .storage
+            .put(
+                "npm/cachedpkg/metadata.json",
+                br#"{"name":"cachedpkg","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"cachedpkg","version":"1.0.0","stale":"do-not-serve-for-a-tag"}}}"#,
+            )
+            .await
+            .unwrap();
+
+        // The concrete version is immutable, so serving our copy of it is right.
+        let resp = send(&ctx.app, Method::GET, "/npm/cachedpkg/1.0.0", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The tag is not. With no local version key it must fall through to the proxy,
+        // which here is a connection-refused address - so anything but a 200 carrying
+        // the cached body proves the tag was not resolved locally.
+        let resp = send(&ctx.app, Method::GET, "/npm/cachedpkg/latest", "").await;
+        let status = resp.status();
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(
+            !body.contains("do-not-serve-for-a-tag"),
+            "a mutable tag must never be answered out of a cached upstream packument, \
+             got {}: {}",
+            status,
+            body
+        );
     }
 
     #[tokio::test]

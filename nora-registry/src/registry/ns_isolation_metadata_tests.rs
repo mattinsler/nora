@@ -502,6 +502,57 @@ async fn npm_internal_exact_pattern_guards_the_version_path() {
     );
 }
 
+#[tokio::test]
+async fn npm_internal_derived_latest_tag_answers_200_not_upstream() {
+    let upstream = upstream_serving_666().await;
+    let ctx = create_test_context_with_config(|c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.npm.proxy = Some(upstream.uri());
+    });
+    // The artemis shape: releases tag `next`, so `latest` exists only as the value
+    // regenerate_packument derived into the packument - there is no dist-tags/latest
+    // key. Before this resolved, `/{pkg}/latest` fell through to the guard and 404'd
+    // while the packument advertised it; on an UNGUARDED name it fell through to the
+    // proxy and answered with upstream's copy of a name we publish ourselves.
+    ctx.state
+        .storage
+        .put(
+            "npm/internalpkg/versions/0.2.0-next.4.json",
+            br#"{"name":"internalpkg","version":"0.2.0-next.4","dist":{}}"#,
+        )
+        .await
+        .unwrap();
+    ctx.state
+        .storage
+        .put("npm/internalpkg/dist-tags/next", b"0.2.0-next.4")
+        .await
+        .unwrap();
+    ctx.state
+        .storage
+        .put(
+            "npm/internalpkg/metadata.json",
+            br#"{"name":"internalpkg","dist-tags":{"latest":"0.2.0-next.4","next":"0.2.0-next.4"},"versions":{"0.2.0-next.4":{"name":"internalpkg","version":"0.2.0-next.4"}}}"#,
+        )
+        .await
+        .unwrap();
+
+    let resp = send(&ctx.app, Method::GET, "/npm/internalpkg/latest", "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a tag the packument advertises must resolve to the version we hold, not 404"
+    );
+    let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+    assert!(
+        body.contains("0.2.0-next.4"),
+        "must serve the version we hold"
+    );
+    assert!(
+        !body.contains("6.6.6"),
+        "and must never reach upstream for a guarded name"
+    );
+}
+
 // ── npm: PR #725 residual — TTL-stale refetch must not re-proxy an internal pkg ──
 
 #[tokio::test]

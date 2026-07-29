@@ -294,8 +294,23 @@ async fn handle_request(
         format!("npm/{}/metadata.json", path)
     };
 
+    // npm's per-version document, `GET /{pkg}/{version}`. Splitting the selector off
+    // is what lets the rest of this handler see the real package name: `package_name`
+    // for `/lodash/4.17.21` used to be the whole string `lodash/4.17.21`, and the
+    // namespace guard below evaluated THAT as if it were a package name. A prefix
+    // pattern (`internal*`) still matched it by accident; an exact pattern
+    // (`internalpkg`) did not, so the guarded name was proxied upstream and served -
+    // the dependency-confusion leak the guard exists to prevent (#526).
+    let version_spec = if is_tarball {
+        None
+    } else {
+        split_npm_version_path(&path)
+    };
+
     let package_name = if is_tarball {
         path.split("/-/").next().unwrap_or(&path).to_string()
+    } else if let Some((pkg, _)) = version_spec {
+        pkg.to_string()
     } else {
         path.clone()
     };
@@ -404,6 +419,21 @@ async fn handle_request(
                 }
                 return response;
             }
+        }
+    }
+
+    // --- Local per-version serve (#526) ---
+    // `GET /{pkg}/{version}` has no cache key of its own that a publish ever writes -
+    // the version data lives under `npm/{pkg}/versions/{v}.json`. Without this lookup
+    // the request always fell through to the guard (404 for a guarded name we are
+    // holding and serving from the packument) or to the proxy (which answered a LOCAL
+    // package's version out of the upstream registry). Both are the same mistake: the
+    // endpoint had no notion of the copy we already hold. This runs before the guard,
+    // for the same reason the packument's cache lookup does - a version sitting in
+    // local storage is not an upstream fetch, so the guard has no business refusing it.
+    if let Some((_, spec)) = version_spec {
+        if let Some(doc) = local_npm_version_document(&state, &package_name, spec).await {
+            return with_content_type(false, doc).into_response();
         }
     }
 
@@ -549,7 +579,10 @@ async fn handle_request(
     // --- Namespace isolation: prevent proxying internal namespaces ---
     // Metadata requests skip the curation check_download (which only runs for
     // tarballs), so we must protect the proxy path separately. This runs after
-    // cache lookup so locally-published packages are still served from cache.
+    // cache lookup so locally-published packages are still served from cache, and
+    // after the per-version lookup above for the same reason (#526). `package_name`
+    // is the package, never `{pkg}/{version}`, so an exact-name pattern guards the
+    // per-version path as surely as a prefix one does.
     //
     // A guarded name we do not hold answers **404, not 403**. The guarantee this
     // filter owes is that a guarded name is never satisfied from upstream, and 404
@@ -1253,6 +1286,87 @@ async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
     }
 }
 
+/// Split an npm metadata path into `(package, selector)` when it addresses npm's
+/// per-version document, `GET /{pkg}/{version}`. `None` means the path is a packument
+/// request and the whole of it is the package name.
+///
+/// A scoped package owns two path segments (`@scope/name`), an unscoped package one;
+/// anything past that is the selector. The selector is a concrete version or a
+/// dist-tag - npm accepts either here - and is returned verbatim, including a
+/// nonsense one, so the caller still gets the real package name to guard on.
+fn split_npm_version_path(path: &str) -> Option<(&str, &str)> {
+    // `-/…` is npm's registry-API namespace (`-/whoami`, `-/v1/search`, the audit
+    // endpoints), never a package name, so it is never a per-version request.
+    if path.starts_with("-/") {
+        return None;
+    }
+    let name_segments = if path.starts_with('@') { 2 } else { 1 };
+    let (slash, _) = path
+        .char_indices()
+        .filter(|&(_, c)| c == '/')
+        .nth(name_segments - 1)?;
+    let (package, selector) = (&path[..slash], &path[slash + 1..]);
+    if package.is_empty() || selector.is_empty() {
+        return None;
+    }
+    Some((package, selector))
+}
+
+/// Resolve npm's per-version document for `{package}@{selector}` from LOCAL storage,
+/// never upstream. `selector` is a concrete version or a dist-tag.
+///
+/// The order, and why it is this order:
+///
+/// 1. `npm/{pkg}/versions/{selector}.json` - the immutable key `handle_publish` writes
+///    (#39 layout), tarball URL already rewritten to this registry. It IS the document
+///    npm wants here, byte for byte.
+/// 2. `npm/{pkg}/dist-tags/{selector}` - the mutable pointer key, also written only by
+///    publish; then (1) for the version it names.
+/// 3. `versions[selector]` inside the packument. Pre-#39 publishes kept their versions
+///    embedded in `metadata.json`, and a packument cached from upstream still does, so
+///    this is the copy we are already serving on the packument path.
+///
+/// Step 3 is **concrete versions only**. An npm version manifest is immutable, so
+/// whichever local copy we hold is the same document whatever wrote it. A dist-tag is
+/// not - it moves - so resolving one out of a cached upstream packument would answer a
+/// mutable question from a stale copy. Tags resolve only through (2), where a local
+/// publish pointer is the truth; anything else falls through to the guard and the proxy.
+async fn local_npm_version_document(
+    state: &AppState,
+    package_name: &str,
+    selector: &str,
+) -> Option<Bytes> {
+    if let Ok(data) = state
+        .storage
+        .get(&format!("npm/{}/versions/{}.json", package_name, selector))
+        .await
+    {
+        return Some(data);
+    }
+
+    if let Ok(pointer) = state
+        .storage
+        .get(&format!("npm/{}/dist-tags/{}", package_name, selector))
+        .await
+    {
+        let version = String::from_utf8(pointer.to_vec()).ok()?;
+        return state
+            .storage
+            .get(&format!("npm/{}/versions/{}.json", package_name, version))
+            .await
+            .ok();
+    }
+
+    let packument = state
+        .storage
+        .get(&format!("npm/{}/metadata.json", package_name))
+        .await
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&packument).ok()?;
+    let version_data = json.get("versions")?.get(selector)?;
+    serde_json::to_vec(version_data).ok().map(Bytes::from)
+}
+
 /// Extract publish date for a specific version from cached npm metadata.
 ///
 /// npm metadata JSON has a `time` object mapping versions to ISO 8601 dates:
@@ -1613,6 +1727,50 @@ mod tests {
     fn test_is_valid_attachment_name_special_chars() {
         assert!(!is_valid_attachment_name("file name.tgz")); // space
         assert!(!is_valid_attachment_name("file;cmd.tgz")); // semicolon
+    }
+
+    // ── split_npm_version_path (#526) ──
+
+    #[test]
+    fn test_split_npm_version_path_packument_is_not_a_version_request() {
+        assert_eq!(split_npm_version_path("lodash"), None);
+        assert_eq!(split_npm_version_path("@babel/core"), None);
+    }
+
+    #[test]
+    fn test_split_npm_version_path_splits_the_selector_off() {
+        assert_eq!(
+            split_npm_version_path("lodash/4.17.21"),
+            Some(("lodash", "4.17.21"))
+        );
+        assert_eq!(
+            split_npm_version_path("@babel/core/7.26.0"),
+            Some(("@babel/core", "7.26.0"))
+        );
+        // npm accepts a dist-tag wherever it accepts a version.
+        assert_eq!(
+            split_npm_version_path("lodash/latest"),
+            Some(("lodash", "latest"))
+        );
+    }
+
+    #[test]
+    fn test_split_npm_version_path_never_splits_the_registry_api_namespace() {
+        // `-/…` is npm's own API surface, not a package - splitting it would hand the
+        // namespace guard the package name `-` instead of the path it evaluates today.
+        assert_eq!(split_npm_version_path("-/v1/search"), None);
+        assert_eq!(split_npm_version_path("-/whoami"), None);
+    }
+
+    #[test]
+    fn test_split_npm_version_path_keeps_a_nonsense_selector_whole() {
+        // The package name is what the guard needs to be right about; a selector that
+        // resolves to nothing simply misses locally and is refused or proxied as usual.
+        assert_eq!(
+            split_npm_version_path("lodash/4.17.21/extra"),
+            Some(("lodash", "4.17.21/extra"))
+        );
+        assert_eq!(split_npm_version_path("lodash/"), None);
     }
 }
 
@@ -2487,6 +2645,115 @@ mod integration_tests {
             )
             .await
             .unwrap();
+    }
+
+    // ── `GET /{pkg}/{version}`: serve the copy we hold (#526) ──
+    //
+    // The endpoint had no local lookup at all. A version's data lives under
+    // `npm/{pkg}/versions/{v}.json`, but the handler derived the cache key
+    // `npm/{pkg}/{v}/metadata.json`, which nothing ever writes - so a locally
+    // published version missed and fell through to the guard or to the proxy. No
+    // proxy is configured in these tests, so before the fix every one of them 404s.
+
+    /// Publish `name@version` through the real PUT handler, as npm would.
+    async fn publish_version(app: &axum::Router, name: &str, version: &str) {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz");
+        let short = name.rsplit('/').next().unwrap();
+        let payload = serde_json::json!({
+            "name": name,
+            "versions": { version: { "name": name, "version": version, "dist": {} } },
+            "_attachments": { format!("{}-{}.tgz", short, version): { "data": b64 } },
+            "dist-tags": { "latest": version }
+        });
+        let resp = send(
+            app,
+            Method::PUT,
+            &format!("/npm/{}", name),
+            Body::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_npm_version_endpoint_serves_a_locally_published_version() {
+        let ctx = create_test_context();
+        publish_version(&ctx.app, "mypkg", "1.0.0").await;
+
+        let resp = send(&ctx.app, Method::GET, "/npm/mypkg/1.0.0", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value =
+            serde_json::from_slice(&body_bytes(resp).await).expect("version doc must be JSON");
+        // npm's per-version document is the version manifest itself, not a packument.
+        assert_eq!(json["name"], "mypkg");
+        assert_eq!(json["version"], "1.0.0");
+        assert!(
+            json.get("versions").is_none(),
+            "the per-version endpoint must answer the manifest, not the packument"
+        );
+        // The tarball URL publish rewrote to this registry must survive the trip.
+        assert!(json["dist"]["tarball"]
+            .as_str()
+            .unwrap()
+            .ends_with("/npm/mypkg/-/mypkg-1.0.0.tgz"));
+    }
+
+    #[tokio::test]
+    async fn test_npm_version_endpoint_serves_a_scoped_package() {
+        // A scoped name owns two path segments, so `@scope/name/version` is three -
+        // the split has to count segments, not slashes.
+        let ctx = create_test_context();
+        publish_version(&ctx.app, "@acme/thing", "2.1.0").await;
+
+        let resp = send(&ctx.app, Method::GET, "/npm/@acme/thing/2.1.0", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json["name"], "@acme/thing");
+        assert_eq!(json["version"], "2.1.0");
+    }
+
+    #[tokio::test]
+    async fn test_npm_version_endpoint_resolves_a_local_dist_tag() {
+        // npm accepts a dist-tag wherever it accepts a version. The pointer key is
+        // written only by publish, so resolving it locally answers from the copy we
+        // own - never from a cached upstream packument, where the tag may have moved.
+        let ctx = create_test_context();
+        publish_version(&ctx.app, "tagged", "3.0.0").await;
+
+        let resp = send(&ctx.app, Method::GET, "/npm/tagged/latest", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json["version"], "3.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_npm_version_endpoint_serves_an_embedded_packument_version() {
+        // Pre-#39 publishes kept their versions inside `metadata.json` with no
+        // per-version keys, and that layout is still on disk on real registries. The
+        // packument path serves those versions, so this one must too.
+        let ctx = create_test_context();
+        let legacy = serde_json::json!({
+            "name": "legacy",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": { "1.0.0": { "name": "legacy", "version": "1.0.0", "dist": {} } }
+        });
+        ctx.state
+            .storage
+            .put(
+                "npm/legacy/metadata.json",
+                &serde_json::to_vec(&legacy).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let resp = send(&ctx.app, Method::GET, "/npm/legacy/1.0.0", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json["version"], "1.0.0");
+
+        // A version we do not hold is still a miss - no proxy configured, so 404.
+        let resp = send(&ctx.app, Method::GET, "/npm/legacy/9.9.9", "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
 

@@ -16,7 +16,8 @@
 //!    the npm section below for why the status differs and why the guarantee does
 //!    not;
 //! 2. a locally-published internal package's metadata is still SERVED (200) — the
-//!    guard must come after the local/cache serve, never blocking a local copy;
+//!    guard must come after the local/cache serve, never blocking a local copy. For
+//!    npm that covers `/{pkg}/{version}` as well as the packument (#526);
 //! 3. a non-internal package is NOT blocked (proxies / 404s normally);
 //! 4. a search query matching an internal pattern is NOT forwarded upstream.
 //!
@@ -362,7 +363,143 @@ async fn npm_unguarded_absent_still_proxies_the_same_upstream() {
         "an unguarded name must still proxy - otherwise the guarded 404 proves nothing"
     );
     let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
-    assert!(body.contains("6.6.6"), "the proxy path must really be serving upstream");
+    assert!(
+        body.contains("6.6.6"),
+        "the proxy path must really be serving upstream"
+    );
+}
+
+// ── npm: `/{pkg}/{version}` answers for a guarded version we hold (#526) ──
+//
+// The packument path was fixed by #516; the per-version path is a different one and
+// was never touched. It had no local lookup at all - a version's data lives under
+// `npm/{pkg}/versions/{v}.json`, and the handler looked for a key nothing writes - so
+// a guarded version NORA was holding and serving from the packument refused here.
+//
+// Correcting that also corrected the name the guard is handed. `package_name` for
+// `/internalpkg/1.0.0` used to be the whole string `internalpkg/1.0.0`. A prefix
+// pattern (`internal*`) matched that by accident; an exact pattern (`internalpkg`)
+// did not, so the guarded name was fetched from upstream and served - the
+// dependency-confusion leak the guard exists to prevent. Both directions below.
+//
+// The upstream is the same live mock as #516's pair, and for the same reason:
+// `BLACKHOLE` cannot tell a guard that held from a proxy that merely failed, since
+// both end in 404. The leak has to be readable as a 200.
+
+#[tokio::test]
+async fn npm_internal_version_held_locally_answers_200() {
+    let upstream = upstream_serving_666().await;
+    let ctx = create_test_context_with_config(|c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.npm.proxy = Some(upstream.uri());
+    });
+    // The layout a publish leaves behind: the immutable per-version key plus the
+    // packument regenerated from it.
+    ctx.state
+        .storage
+        .put(
+            "npm/internalpkg/versions/1.0.0.json",
+            br#"{"name":"internalpkg","version":"1.0.0","dist":{}}"#,
+        )
+        .await
+        .unwrap();
+    ctx.state
+        .storage
+        .put(
+            "npm/internalpkg/metadata.json",
+            br#"{"name":"internalpkg","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"internalpkg","version":"1.0.0"}}}"#,
+        )
+        .await
+        .unwrap();
+
+    let resp = send(&ctx.app, Method::GET, "/npm/internalpkg/1.0.0", "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a guarded version held locally must be served here exactly as the packument \
+         serves it: the guard stops a name being satisfied from UPSTREAM, and a version \
+         sitting in local storage is not that"
+    );
+    let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+    assert!(body.contains("\"1.0.0\""), "must serve the version we hold");
+    assert!(
+        !body.contains("6.6.6"),
+        "and must serve it from local storage, never from upstream"
+    );
+}
+
+/// NB this one passed before the fix too: `internal*` is a prefix pattern, so it
+/// matched the bogus name `internalpkg/6.6.6` the guard used to be handed, and the
+/// refusal happened by accident. It pins the criterion; the exact-pattern test below
+/// is what makes the guard's presence readable.
+#[tokio::test]
+async fn npm_internal_version_absent_answers_404_and_never_upstream() {
+    let upstream = upstream_serving_666().await;
+    let ctx = create_test_context_with_config(|c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.npm.proxy = Some(upstream.uri());
+    });
+
+    let resp = send(&ctx.app, Method::GET, "/npm/internalpkg/6.6.6", "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a guarded version we do not hold is refused, and refusing means 'not from \
+         upstream' - the same 404 the packument path answers"
+    );
+    let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+    assert!(
+        !body.contains("6.6.6"),
+        "guarded name must never be satisfied from upstream, whatever the status"
+    );
+}
+
+#[tokio::test]
+async fn npm_unguarded_version_absent_still_proxies_the_same_upstream() {
+    let upstream = upstream_serving_666().await;
+    let ctx = create_test_context_with_config(|c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.npm.proxy = Some(upstream.uri());
+    });
+
+    // Same upstream, same request shape, a name the filter does not cover. This is
+    // what makes the 404 above evidence of the guard rather than of a dead proxy.
+    let resp = send(&ctx.app, Method::GET, "/npm/publicpkg/6.6.6", "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "an unguarded version must still proxy - otherwise the guarded 404 proves nothing"
+    );
+    let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+    assert!(
+        body.contains("6.6.6"),
+        "the proxy path must really be serving upstream"
+    );
+}
+
+#[tokio::test]
+async fn npm_internal_exact_pattern_guards_the_version_path() {
+    let upstream = upstream_serving_666().await;
+    let ctx = create_test_context_with_config(|c| {
+        // An exact name, no wildcard - the ordinary way to guard a single package.
+        c.curation.internal_namespaces = vec!["exactpkg".to_string()];
+        c.npm.proxy = Some(upstream.uri());
+    });
+
+    // The guard used to be handed `exactpkg/6.6.6`, which this pattern does not match,
+    // so the guarded name was fetched from upstream and served with a 200. A prefix
+    // pattern hid the hole by matching the version string too; an exact one did not.
+    let resp = send(&ctx.app, Method::GET, "/npm/exactpkg/6.6.6", "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "an exact-name pattern must guard the per-version path as surely as a prefix one"
+    );
+    let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+    assert!(
+        !body.contains("6.6.6"),
+        "an exact-name pattern must not leak the guarded name upstream"
+    );
 }
 
 // ── npm: PR #725 residual — TTL-stale refetch must not re-proxy an internal pkg ──

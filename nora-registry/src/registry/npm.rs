@@ -70,49 +70,58 @@ async fn handle_npm_post(
     };
 
     // Only a remote/proxy repo can answer audits (advisories come from upstream).
-    // Hosted-only (no proxy) → npm-compatible empty result so `npm audit` doesn't
-    // hard-fail — npm treats a 200 `{}` as "no advisories".
+    // Hosted-only (no proxy) has no advisory source at all - and "I have no source"
+    // is NOT "you have no vulnerabilities", so it refuses rather than answering an
+    // empty map. See `audit_unavailable` for why every such path is now loud.
     let Some(proxy_url) = state.config.npm.proxy.clone() else {
-        return npm_empty_audit();
+        return audit_unavailable(
+            "this registry has no npm proxy configured, so it has no advisory source",
+        );
+    };
+
+    // Decode the request body BEFORE anything inspects it. npm7+/bun gzip this
+    // request (npm's own registry accepts it), so a registry that cannot read a
+    // compressed body cannot audit at all.
+    let body = match decode_audit_body(&headers, &body) {
+        Ok(plain) => plain,
+        Err(response) => return *response,
     };
 
     // #68/#733 dependency-confusion: never send internal package names upstream.
     // When a namespace filter is configured we must SEE plaintext names to strip
-    // them, so ANY body we cannot verify — the quick lockfile, an encoded bulk body,
-    // or a bulk body that is not the expected JSON object — is refused (fail CLOSED,
-    // symmetric across both paths). With no filter, nothing is internal → forward
-    // verbatim.
+    // them. A bulk body is JSON we can read and strip - including a compressed one,
+    // now that it is decoded above. The npm6 quick body is a lockfile we cannot
+    // per-name strip, so under a filter it is refused - LOUDLY. With no filter,
+    // nothing is internal, so the decoded body forwards as-is.
     let engine = &state.curation().curation_engine;
     let filter_active = crate::curation::namespace_filter_active(engine);
-    let content_encoded = headers
-        .get(header::CONTENT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| !s.eq_ignore_ascii_case("identity"));
     let forward_body: Vec<u8> = if !filter_active {
-        body.to_vec()
-    } else if is_quick || content_encoded {
-        return npm_empty_audit();
+        body
+    } else if is_quick {
+        return audit_unavailable(
+            "npm6 audits/quick sends a lockfile whose package names cannot be filtered; \
+             use the npm7+ advisories/bulk endpoint",
+        );
     } else {
         match strip_internal_bulk(&body, engine) {
             Some(stripped) => stripped,
-            None => return npm_empty_audit(), // unparsable under a filter → refuse
+            None => return audit_bad_request("bulk advisory body is not the expected JSON object"),
         }
     };
 
     // Allowlist the forwarded headers; carry the configured proxy credential only —
     // NEVER the client's Authorization (it's the caller's NORA token).
+    //
+    // `content-encoding` is deliberately NOT forwarded: `forward_body` is always
+    // plaintext by this point (decoded above, and re-serialized when stripped), so
+    // passing the client's encoding through would describe the body as compressed
+    // when it is not.
     let mut fwd: Vec<(&str, &str)> = Vec::new();
     if let Some(v) = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
     {
         fwd.push(("content-type", v));
-    }
-    if let Some(v) = headers
-        .get(header::CONTENT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-    {
-        fwd.push(("content-encoding", v));
     }
     if let Some(v) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) {
         fwd.push(("accept", v));
@@ -154,18 +163,110 @@ async fn handle_npm_post(
     }
 }
 
-/// npm-compatible "no advisories" response — a `200 {}` that `npm audit` accepts
-/// without erroring.
-fn npm_empty_audit() -> Response {
+/// A `200 {}` on this endpoint MEANS "upstream checked and you are clean", and it
+/// is the single most dangerous response this handler can send, because a client
+/// renders it as `No vulnerabilities found` and exits 0. NORA therefore never
+/// manufactures one: every empty result a caller sees came from upstream.
+///
+/// That invariant was learned the hard way. This handler used to answer `200 {}`
+/// whenever it declined to process a request - a compressed body, an npm6
+/// lockfile, an unparsable body, a missing proxy - which is fail-CLOSED for
+/// dependency confusion (nothing leaks upstream) and fail-OPEN for the thing the
+/// endpoint exists to do. `bun audit` gzips its request body, so on any NORA with
+/// a namespace filter every audit reported `No vulnerabilities found` over real
+/// critical advisories, in CI, silently. "I could not read your request" and "you
+/// have no vulnerabilities" must never look identical to a client.
+///
+/// `audit_unavailable` is for "this registry cannot answer that", and
+/// `audit_bad_request` for "that request was not something I can read".
+fn audit_unavailable(reason: &str) -> Response {
+    tracing::warn!(registry = "npm", reason, "npm audit refused");
     (
-        StatusCode::OK,
+        StatusCode::NOT_IMPLEMENTED,
         [(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         )],
-        b"{}".to_vec(),
+        serde_json::json!({ "error": reason }).to_string(),
     )
         .into_response()
+}
+
+/// The request body was not something this endpoint can read. Distinct from
+/// `audit_unavailable`: the caller can fix this one.
+fn audit_bad_request(reason: &str) -> Response {
+    tracing::warn!(
+        registry = "npm",
+        reason,
+        "npm audit rejected a request body"
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        serde_json::json!({ "error": reason }).to_string(),
+    )
+        .into_response()
+}
+
+/// Decode an audit request body according to its `content-encoding`.
+///
+/// npm7+ and bun compress this request (and only this one - a publish PUT goes up
+/// uncompressed), so refusing compressed bodies means refusing every real audit.
+///
+/// Decompression is bounded by `NPM_AUDIT_BODY_CAP`, the same cap the compressed
+/// read uses: this is attacker-influenced input, and a few KB of gzip expands to
+/// gigabytes if nothing stops it.
+fn decode_audit_body(headers: &HeaderMap, body: &Bytes) -> Result<Vec<u8>, Box<Response>> {
+    use std::io::Read;
+
+    let encoding = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+
+    // Absent or `identity` means the bytes are already plaintext.
+    if encoding.is_empty() || encoding == "identity" {
+        return Ok(body.to_vec());
+    }
+
+    // Bound the OUTPUT, not just the input: read one byte past the cap so an
+    // over-large expansion is detected rather than silently truncated into a body
+    // that then parses as fewer packages than the client asked about.
+    fn bounded<R: Read>(reader: R) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        reader
+            .take(NPM_AUDIT_BODY_CAP as u64 + 1)
+            .read_to_end(&mut out)?;
+        Ok(out)
+    }
+
+    let decoded = match encoding.as_str() {
+        "gzip" | "x-gzip" => bounded(flate2::read::GzDecoder::new(body.as_ref())),
+        // HTTP `deflate` is zlib-wrapped per RFC, but raw-deflate senders exist;
+        // try the spec shape first and fall back rather than rejecting them.
+        "deflate" => bounded(flate2::read::ZlibDecoder::new(body.as_ref()))
+            .or_else(|_| bounded(flate2::read::DeflateDecoder::new(body.as_ref()))),
+        other => {
+            return Err(Box::new(audit_unavailable(&format!(
+                "unsupported content-encoding `{other}`; this endpoint accepts identity, gzip, or deflate"
+            ))))
+        }
+    };
+
+    match decoded {
+        Ok(plain) if plain.len() > NPM_AUDIT_BODY_CAP => Err(Box::new(audit_bad_request(
+            "decompressed audit body exceeds the size cap",
+        ))),
+        Ok(plain) => Ok(plain),
+        Err(e) => Err(Box::new(audit_bad_request(&format!(
+            "audit body could not be decompressed as `{encoding}`: {e}"
+        )))),
+    }
 }
 
 /// Strip internal-namespace package keys from an npm7 bulk-advisories body
@@ -3341,9 +3442,11 @@ mod spec_conformance_tests {
         );
     }
 
-    /// Hosted-only repo (no upstream proxy) → npm-compatible empty result, not 405/500.
+    /// Hosted-only repo (no upstream proxy) has no advisory source, so it REFUSES.
+    /// It used to answer `200 {}`, which a client renders as "no vulnerabilities" -
+    /// a clean bill of health from a registry that never checked anything.
     #[tokio::test]
-    async fn test_npm_audit_no_proxy_returns_empty() {
+    async fn test_npm_audit_no_proxy_refuses_loudly() {
         use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
         use axum::http::{Method, StatusCode};
 
@@ -3357,8 +3460,8 @@ mod spec_conformance_tests {
             r#"{"lodash":["4.17.0"]}"#,
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(&body_bytes(resp).await[..], b"{}");
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_ne!(&body_bytes(resp).await[..], b"{}");
     }
 
     /// quick audit (gzipped lockfile — cannot per-name strip) is refused with an
@@ -3389,8 +3492,10 @@ mod spec_conformance_tests {
             "lockfile-payload",
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(&body_bytes(resp).await[..], b"{}");
+        // Still fails closed - upstream is never contacted - but the caller is now
+        // TOLD, instead of being handed a clean bill of health.
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_ne!(&body_bytes(resp).await[..], b"{}");
         assert_eq!(
             upstream.received_requests().await.unwrap().len(),
             0,
@@ -3429,19 +3534,25 @@ mod spec_conformance_tests {
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    /// Review #1 regression: a Content-Encoded (e.g. gzipped) bulk body under an
-    /// active namespace filter cannot be name-verified → must fail CLOSED (refuse,
-    /// upstream never contacted), not forward internal names.
+    /// A gzipped bulk body under an active namespace filter is DECODED, stripped,
+    /// and forwarded - the internal name never leaves, the public one is audited.
+    ///
+    /// This is the regression test for the silent-green bug (fork issue #5). It
+    /// used to refuse and answer `200 {}`: fail-closed for dependency confusion,
+    /// fail-open for the security check itself. `bun audit` gzips every advisory
+    /// request, so on any NORA with a namespace filter every audit reported "no
+    /// vulnerabilities" over real critical advisories.
     #[tokio::test]
-    async fn test_npm_audit_bulk_encoded_refused_under_filter() {
-        use crate::test_helpers::{body_bytes, create_test_context_with_config, send_with_headers};
+    async fn test_npm_audit_bulk_gzip_is_decoded_and_stripped() {
+        use crate::test_helpers::{create_test_context_with_config, send_with_headers};
         use axum::http::{Method, StatusCode};
+        use std::io::Write;
         use wiremock::matchers::any;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let upstream = MockServer::start().await;
         Mock::given(any())
-            .respond_with(ResponseTemplate::new(200).set_body_string("LEAKED"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"lodash":[{"id":1}]}"#))
             .mount(&upstream)
             .await;
 
@@ -3450,22 +3561,109 @@ mod spec_conformance_tests {
             cfg.curation.mode = crate::config::CurationMode::Enforce;
             cfg.curation.internal_namespaces = vec!["@internal/*".to_string()];
         });
-        // Claims gzip encoding → NORA cannot see the names → must refuse.
+
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(br#"{"lodash":["4.17.0"],"@internal/secret":["1.0.0"]}"#)
+            .unwrap();
+        let gz = enc.finish().unwrap();
+
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/advisories/bulk",
+            vec![
+                ("content-encoding", "gzip"),
+                ("content-type", "application/json"),
+            ],
+            gz,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let reqs = upstream.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "the decoded body must be forwarded");
+        let fwd = String::from_utf8_lossy(&reqs[0].body);
+        assert!(fwd.contains("lodash"), "public pkg forwarded: {fwd}");
+        assert!(
+            !fwd.contains("@internal/secret"),
+            "internal name must still be stripped after decoding: {fwd}"
+        );
+        // We send plaintext upstream, so we must not claim it is still gzipped.
+        assert!(
+            reqs[0].headers.get("content-encoding").is_none(),
+            "content-encoding must not be forwarded with a decoded body"
+        );
+    }
+
+    /// An encoding we cannot decode is refused, never answered as "clean".
+    #[tokio::test]
+    async fn test_npm_audit_unknown_encoding_refused() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send_with_headers};
+        use axum::http::{Method, StatusCode};
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some("http://127.0.0.1:1".to_string());
+        });
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/advisories/bulk",
+            vec![("content-encoding", "banana")],
+            r#"{"lodash":["4.17.0"]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_ne!(&body_bytes(resp).await[..], b"{}");
+    }
+
+    /// A body that claims gzip but is not gzip is a bad request, not a clean audit.
+    #[tokio::test]
+    async fn test_npm_audit_corrupt_gzip_refused() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send_with_headers};
+        use axum::http::{Method, StatusCode};
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some("http://127.0.0.1:1".to_string());
+        });
         let resp = send_with_headers(
             &ctx.app,
             Method::POST,
             "/npm/-/npm/v1/security/advisories/bulk",
             vec![("content-encoding", "gzip")],
-            "gzipped-body-not-inspected-because-refused",
+            "this is not gzip",
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(&body_bytes(resp).await[..], b"{}");
-        assert_eq!(
-            upstream.received_requests().await.unwrap().len(),
-            0,
-            "encoded bulk under a filter must NOT be forwarded"
-        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_ne!(&body_bytes(resp).await[..], b"{}");
+    }
+
+    /// A decompression bomb is capped rather than buffered. Guards the new decode
+    /// path: a few KB of gzip expands to far more than the body cap.
+    #[tokio::test]
+    async fn test_npm_audit_gzip_bomb_is_capped() {
+        use crate::test_helpers::{create_test_context_with_config, send_with_headers};
+        use axum::http::{Method, StatusCode};
+        use std::io::Write;
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some("http://127.0.0.1:1".to_string());
+        });
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        // Well past NPM_AUDIT_BODY_CAP once expanded, a few KB on the wire.
+        enc.write_all(&vec![b'a'; super::NPM_AUDIT_BODY_CAP + 1024])
+            .unwrap();
+        let bomb = enc.finish().unwrap();
+        assert!(bomb.len() < 100_000, "bomb should be small compressed");
+
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/advisories/bulk",
+            vec![("content-encoding", "gzip")],
+            bomb,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     /// Review #3 regression: upstream 5xx must surface as 502 (audit-endpoint error),
@@ -3532,17 +3730,28 @@ mod spec_conformance_tests {
     }
 
     /// Under `anonymous_read`, an unauthenticated `npm audit` POST must pass the
-    /// auth gate (audit is a read-semantics query) and reach the handler — hosted-
-    /// only (no proxy) → 200 `{}`. A non-audit npm POST stays gated → 401.
+    /// auth gate (audit is a read-semantics query) and reach the handler, which
+    /// forwards it upstream. A non-audit npm POST stays gated → 401.
+    ///
+    /// The upstream is mocked rather than absent on purpose: this test used to
+    /// prove "the gate was passed" with the `200 {}` a proxy-less handler returned
+    /// without auditing anything, which is the response fork issue #5 retired.
     #[tokio::test]
     async fn test_npm_audit_anonymous_read_allows_post() {
         use crate::test_helpers::{create_test_context_with_config, send};
         use axum::http::{Method, StatusCode};
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&upstream)
+            .await;
         let ctx = create_test_context_with_config(|cfg| {
             cfg.auth.enabled = true;
             cfg.auth.anonymous_read = true;
-            cfg.npm.proxy = None; // hosted-only → handler returns 200 {}
+            cfg.npm.proxy = Some(upstream.uri());
         });
         let audit = send(
             &ctx.app,

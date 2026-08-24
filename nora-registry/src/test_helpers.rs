@@ -78,6 +78,18 @@ pub fn create_test_context_with_config(customize: impl FnOnce(&mut Config)) -> T
     build_context(false, &[], false, customize)
 }
 
+/// Build a test context with auth AND custom config tweaks.
+///
+/// Needed by any auth test whose route then does real work: asserting a 200 on a
+/// handler that silently no-ops without config is how an auth test ends up
+/// measuring the no-op instead of the auth gate.
+pub fn create_test_context_with_auth_and_config(
+    users: &[(&str, &str)],
+    customize: impl FnOnce(&mut Config),
+) -> TestContext {
+    build_context(true, users, false, customize)
+}
+
 fn build_context(
     auth_enabled: bool,
     users: &[(&str, &str)],

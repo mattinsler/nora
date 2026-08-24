@@ -1221,7 +1221,18 @@ mod integration_tests {
     #[tokio::test]
     async fn test_npm_audit_read_token_is_accepted() {
         for route in NPM_AUDIT_ROUTES {
-            let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+            // A proxy is configured on purpose. With none, the handler refuses
+            // (501) and this test would be measuring the refusal, not the role
+            // gate - which is exactly how it used to pass against a `200 {}` the
+            // handler produced without auditing anything (fork issue #5).
+            let upstream = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::any())
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("{}"))
+                .mount(&upstream)
+                .await;
+            let ctx = create_test_context_with_auth_and_config(&[("admin", "secret")], |cfg| {
+                cfg.npm.proxy = Some(upstream.uri());
+            });
             let tokens = ctx.state.tokens.as_ref().unwrap();
             let read = tokens
                 .create_token("ci", 30, None, crate::tokens::Role::Read)
@@ -1325,7 +1336,14 @@ mod integration_tests {
     #[tokio::test]
     async fn test_npm_audit_read_token_accepted_via_basic_auth() {
         for route in NPM_AUDIT_ROUTES {
-            let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+            let upstream = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::any())
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("{}"))
+                .mount(&upstream)
+                .await;
+            let ctx = create_test_context_with_auth_and_config(&[("admin", "secret")], |cfg| {
+                cfg.npm.proxy = Some(upstream.uri());
+            });
             let read = ctx
                 .state
                 .tokens

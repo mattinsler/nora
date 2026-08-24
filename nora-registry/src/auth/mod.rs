@@ -297,12 +297,39 @@ pub async fn auth_middleware(
     // npm audit (#597) is a read-semantics query that npm sends as a POST (npm7
     // `advisories/bulk`, npm6 `audits/quick`). Treat it as read-eligible under
     // `anonymous_read` so anonymous `npm audit` works wherever anonymous install
-    // works. Safe: the handler (registry/npm.rs) mutates nothing (forwards to the
-    // configured upstream, returns advisories), caps the body, strips internal
-    // package names under a filter, and never forwards the client credential.
+    // works, and as a read for the role gate below. Safe: the handler
+    // (registry/npm.rs) mutates nothing (forwards to the configured upstream,
+    // returns advisories), caps the body, strips internal package names under a
+    // filter, and never forwards the client credential.
     let is_npm_audit = *request.method() == axum::http::Method::POST
         && (path == "/npm/-/npm/v1/security/advisories/bulk"
             || path == "/npm/-/npm/v1/security/audits/quick");
+
+    // Does this request need the write role? The method decides it everywhere
+    // except the two npm audit routes above, which are a query wearing a POST.
+    //
+    // insler-dev#1815: without that exemption `bun audit` cannot run against NORA
+    // at all under a read token - it answers 403 - and both workarounds are worse
+    // than the bug. Handing CI a write token to perform a read undoes the
+    // read/write split; pointing audit at npmjs violates the rule that nothing
+    // falls back to public npm (and `bun audit` has no `--registry` flag anyway).
+    //
+    // This is not a regression, which is why it needed a fourth patch rather than
+    // a revert: `anonymous_read` used to let the POST past before any role was
+    // consulted, so the role gate was never reached on this path and never grew
+    // the exemption the anonymous gate has carried since #597. Enforcing auth is
+    // what exposed the asymmetry.
+    //
+    // Scope is the two audit paths by exact match - not a prefix - so no sibling
+    // under `/npm/-/npm/v1/security/` rides along, and every other write method
+    // on every other path is untouched.
+    let requires_write_role = matches!(
+        *request.method(),
+        axum::http::Method::PUT
+            | axum::http::Method::POST
+            | axum::http::Method::DELETE
+            | axum::http::Method::PATCH
+    ) && !is_npm_audit;
 
     // A request that presents credentials is always validated below (honest
     // `docker login`, correct audit attribution) — never short-circuited to
@@ -378,13 +405,7 @@ pub async fn auth_middleware(
                     if let Some(ip) = client_ip {
                         state.auth_failures.record_success(&ip);
                     }
-                    let method = request.method().clone();
-                    if (method == axum::http::Method::PUT
-                        || method == axum::http::Method::POST
-                        || method == axum::http::Method::DELETE
-                        || method == axum::http::Method::PATCH)
-                        && !role.can_write()
-                    {
+                    if requires_write_role && !role.can_write() {
                         return (StatusCode::FORBIDDEN, "Read-only token").into_response();
                     }
                     if is_admin && !role.can_admin() {
@@ -431,13 +452,7 @@ pub async fn auth_middleware(
                             role = ?identity.role,
                             "OIDC authentication successful"
                         );
-                        let method = request.method().clone();
-                        if (method == axum::http::Method::PUT
-                            || method == axum::http::Method::POST
-                            || method == axum::http::Method::DELETE
-                            || method == axum::http::Method::PATCH)
-                            && !identity.role.can_write()
-                        {
+                        if requires_write_role && !identity.role.can_write() {
                             return (StatusCode::FORBIDDEN, "Read-only OIDC identity")
                                 .into_response();
                         }
@@ -525,13 +540,7 @@ pub async fn auth_middleware(
             if let Some(ip) = client_ip {
                 state.auth_failures.record_success(&ip);
             }
-            let method = request.method().clone();
-            if (method == axum::http::Method::PUT
-                || method == axum::http::Method::POST
-                || method == axum::http::Method::DELETE
-                || method == axum::http::Method::PATCH)
-                && !role.can_write()
-            {
+            if requires_write_role && !role.can_write() {
                 return (StatusCode::FORBIDDEN, "Read-only token").into_response();
             }
             // An API token sent as the Basic password is a full bearer identity
@@ -1186,6 +1195,159 @@ mod integration_tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// The two npm advisory routes. npm7/bun use `advisories/bulk`, npm6 uses
+    /// `audits/quick`.
+    const NPM_AUDIT_ROUTES: [&str; 2] = [
+        "/npm/-/npm/v1/security/advisories/bulk",
+        "/npm/-/npm/v1/security/audits/quick",
+    ];
+
+    /// insler-dev#1815: `bun audit` cannot run against NORA with the read-role
+    /// token CI carries.
+    ///
+    /// The advisory endpoints only *query* an advisory database - the handler
+    /// forwards to the configured upstream and mutates nothing - but npm sends
+    /// them as a POST, and the middleware classified every POST as a write. So a
+    /// read token was refused on a read.
+    ///
+    /// This never regressed; it was never enforced. `anonymous_read` let the POST
+    /// skip the auth check entirely, and `is_npm_audit` already exempted these two
+    /// routes from *that* gate. Turning enforcement on is what exposed the role
+    /// gate having no matching exemption.
+    ///
+    /// All three arms of the live measurement, for both routes.
+    #[tokio::test]
+    async fn test_npm_audit_read_token_is_accepted() {
+        for route in NPM_AUDIT_ROUTES {
+            let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+            let tokens = ctx.state.tokens.as_ref().unwrap();
+            let read = tokens
+                .create_token("ci", 30, None, crate::tokens::Role::Read)
+                .unwrap();
+            let write = tokens
+                .create_token("ci", 30, None, crate::tokens::Role::Write)
+                .unwrap();
+
+            // No credential is still 401 - this widens the role gate, not the door.
+            let anon =
+                send_with_headers(&ctx.app, Method::POST, route, vec![], b"{}".to_vec()).await;
+            assert_eq!(
+                anon.status(),
+                StatusCode::UNAUTHORIZED,
+                "{route}: no token must still be refused"
+            );
+
+            // A read token is the case that was broken: 403 before the fix.
+            let hv = format!("Bearer {read}");
+            let resp = send_with_headers(
+                &ctx.app,
+                Method::POST,
+                route,
+                vec![("authorization", &hv)],
+                b"{}".to_vec(),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{route}: a read token must be accepted on an advisory query"
+            );
+
+            // A write token keeps working exactly as before.
+            let hv = format!("Bearer {write}");
+            let resp = send_with_headers(
+                &ctx.app,
+                Method::POST,
+                route,
+                vec![("authorization", &hv)],
+                b"{}".to_vec(),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{route}: a write token must be unaffected"
+            );
+        }
+    }
+
+    /// The exemption is the two advisory routes and nothing else. A read token
+    /// must still be refused on every other POST/PUT/DELETE/PATCH, including the
+    /// npm publish that shares the `/npm` prefix and the near-miss paths that
+    /// differ from an advisory route by one segment.
+    #[tokio::test]
+    async fn test_npm_audit_exemption_does_not_widen_other_writes() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let read = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("ci", 30, None, crate::tokens::Role::Read)
+            .unwrap();
+        let hv = format!("Bearer {read}");
+
+        // (method, path) that must all stay 403 for a read token.
+        let cases: [(Method, &str); 6] = [
+            // The publish this token must never be able to perform.
+            (Method::PUT, "/npm/@insler/cli"),
+            (Method::PUT, "/raw/test.txt"),
+            (Method::DELETE, "/raw/test.txt"),
+            // Near-misses: same prefix, not an advisory query.
+            (Method::POST, "/npm/-/npm/v1/security/advisories"),
+            (Method::POST, "/npm/-/npm/v1/security/audits"),
+            (Method::POST, "/npm/-/npm/v1/security/advisories/bulk/x"),
+        ];
+
+        for (method, path) in cases {
+            let resp = send_with_headers(
+                &ctx.app,
+                method.clone(),
+                path,
+                vec![("authorization", &hv)],
+                b"{}".to_vec(),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {path} must still require the write role"
+            );
+        }
+    }
+
+    /// The same exemption on the Basic-auth path, where an API token is sent as
+    /// the password (#737). `bun` and `npm` both send Basic when the registry
+    /// config carries `_auth` rather than `_authToken`, so a fix that only covers
+    /// Bearer leaves half the clients broken.
+    #[tokio::test]
+    async fn test_npm_audit_read_token_accepted_via_basic_auth() {
+        for route in NPM_AUDIT_ROUTES {
+            let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+            let read = ctx
+                .state
+                .tokens
+                .as_ref()
+                .unwrap()
+                .create_token("ci", 30, None, crate::tokens::Role::Read)
+                .unwrap();
+            let hv = format!("Basic {}", STANDARD.encode(format!("ci:{read}")));
+            let resp = send_with_headers(
+                &ctx.app,
+                Method::POST,
+                route,
+                vec![("authorization", &hv)],
+                b"{}".to_vec(),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{route}: a read token via Basic must be accepted"
+            );
+        }
     }
 
     /// Path of a stored token's on-disk file inside a test context.
